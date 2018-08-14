@@ -26,7 +26,7 @@ import tensorflow.contrib.slim as slim
 from tfcv_dataloader import *
 from average_gradients import *
 
-from deep3d_model_src import *
+from deep3d_model import *
 
 parser = argparse.ArgumentParser(description='tfcv TensorFlow implementation.')
 
