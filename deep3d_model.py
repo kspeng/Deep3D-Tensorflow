@@ -7,9 +7,8 @@
 # For any other use of the software not covered by the UCLB ACP-A Licence, 
 # please contact info@uclb.com
 
-"""Fully convolutional model for monocular depth estimation
-    by Clement Godard, Oisin Mac Aodha and Gabriel J. Brostow
-    http://visual.cs.ucl.ac.uk/pubs/monoDepth/
+""" Deep3D tensorflow reimplementation
+    by Kuo Shiuan Peng
 """
 
 from __future__ import absolute_import, division, print_function
@@ -20,12 +19,13 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 
-search_rng = 65
+search_rng = 33
 left_shift_ = int((search_rng-1)/2)
 
 tfcv_parameters = namedtuple('parameters', 
                         'encoder, '
                         'height, width, '
+                        'height_o, width_o, '                        
                         'batch_size, '
                         'num_threads, '
                         'num_epochs, '
@@ -133,7 +133,7 @@ class deep3dModel(object):
         return smoothness_x + smoothness_y
 
     ## CNN functions
-    def conv(self, x, num_out_layers, kernel_size, stride=1, activation_fn=tf.nn.elu):
+    def conv(self, x, num_out_layers, kernel_size, stride=1, activation_fn=tf.nn.relu):
         p = np.floor((kernel_size - 1) / 2).astype(np.int32)
         p_x = tf.pad(x, [[0, 0], [p, p], [p, p], [0, 0]])
         return slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn)
@@ -143,7 +143,7 @@ class deep3dModel(object):
         conv2 = self.conv(conv1, num_out_layers, kernel_size, 1)
         return conv2
 
-    def fully_conn(self, x, num_out_layers, l2_penalty=1e-8, activation_fn=tf.nn.elu):
+    def fully_conn(self, x, num_out_layers, l2_penalty=1e-8, activation_fn=tf.nn.relu):
         net = slim.flatten(x)
         output = slim.fully_connected(net, num_out_layers, activation_fn=activation_fn, 
             weights_regularizer=slim.l2_regularizer(l2_penalty))
@@ -165,35 +165,39 @@ class deep3dModel(object):
         conv = slim.conv2d_transpose(p_x, num_out_layers, kernel_size, stride, 'SAME')      
         if(pad):
             pad_ = stride*pad
-            return conv[:,pad_:-pad_,pad_:-pad_,:]
+            return tf.nn.relu(conv[:,pad_:-pad_,pad_:-pad_,:])
         else:
-            return conv
+            return tf.nn.relu(conv)
 
     def pred_deconv(self, x, num_out_layers, scale):
         bn_pool = slim.batch_norm(x)
-        pred = self.conv(bn_pool, num_out_layers, 3, 1)
-        pred_deconv = self.deconv(pred, num_out_layers=num_out_layers, kernel_size=2*scale, stride=scale, pad=scale/2)        
+        pred_conv = self.conv(bn_pool, num_out_layers, 3, 1)
+        pred_deconv = self.deconv(pred_conv, num_out_layers=num_out_layers, kernel_size=2*scale, stride=scale, pad=scale/2)        
         return pred_deconv
 
     def build_vgg(self):
         batchNum = self.params.batch_size        
         layerNum = search_rng
         with tf.variable_scope('encoder'):
-            conv1 = self.conv(self.model_input, 64, 3,  1)
-            pool1 = self.maxpool(conv1,                 2)   # H/2
+            conv1 = self.conv_block(self.model_input,   64, 3)
+            pool1 = self.maxpool(conv1,                     2)   # H/2
             
-            conv2 = self.conv(pool1,           128, 3,  1)
-            pool2 = self.maxpool(conv2,                 2)   # H/4
+            conv2 = self.conv_block(pool1,             128, 3)
+            pool2 = self.maxpool(conv2,                     2)   # H/4
 
-            conv3 = self.conv_block(pool2,         256, 3)   # H/4
-            pool3 = self.maxpool(conv3,                 2)   # H/8
+            conv3_1 = self.conv_block(pool2,           256, 3)   # H/4
+            conv3_2 = self.conv_block(conv3_1,         256, 3)   # H/4
+            pool3 = self.maxpool(conv3_2,                   2)   # H/8
 
-            conv4 = self.conv_block(pool3,         512, 3)   # H/8
-            pool4 = self.maxpool(conv4,                 2)   # H/16
+            conv4_1 = self.conv_block(pool3,           512, 3)   # H/8
+            conv4_2 = self.conv_block(conv4_1,         512, 3)   # H/8
+            pool4 = self.maxpool(conv4_2,                   2)   # H/16
 
-            conv5 = self.conv_block(pool4,         512, 3)   # H/16
-            pool5 = self.maxpool(conv5,                 2)   # H/32
+            conv5_1 = self.conv_block(pool4,           512, 3)   # H/16
+            conv5_2 = self.conv_block(conv5_1,         512, 3)   # H/16
+            pool5 = self.maxpool(conv5_2,                   2)   # H/32
             if(1):
+                #fc8m_0  = self.conv_block(pool5, layerNum*4, 3)   # H/32
                 fc8m  = self.conv_block(pool5,    layerNum, 3)   # H/32
             ##///// fully connected
             else:
@@ -203,31 +207,30 @@ class deep3dModel(object):
                 fc7   = self.fully_conn(drop6,            512)   # 512
                 drop7 = slim.dropout(fc7,     keep_prob = 0.5)
 
-                fc8   = self.fully_conn(drop7,        4*12*layerNum)   # 4*12*33
-                fc8m  = tf.reshape(fc8, [batchNum, 4, 12, layerNum])   # 4, 12, 33
+                fc8   = self.fully_conn(drop7,        6*12*layerNum)   # 4*12*33
+                fc8m  = tf.reshape(fc8, [batchNum, 6, 12, layerNum])   # 4, 12, 33
 
 
         with tf.variable_scope('decoder'):
-           
+            '''
             scale = 1
             bn_pool1 = slim.batch_norm(pool1)
             pred1 = self.conv(bn_pool1,          layerNum, 3, 1)
             pred1 = self.deconv(pred1, layerNum, scale, scale,0)
-            pred2 = self.pred_deconv(pool2,         layerNum, 2)           
-            pred3 = self.pred_deconv(pool3,         layerNum, 4)
-            pred4 = self.pred_deconv(pool4,         layerNum, 8)            
-            pred5 = self.pred_deconv(fc8m,         layerNum, 16)            
+            '''
+            pred1 = self.pred_deconv(pool1,       layerNum, 1)                       
+            pred2 = self.pred_deconv(pool2,       layerNum, 2)           
+            pred3 = self.pred_deconv(pool3,       layerNum, 4)
+            pred4 = self.pred_deconv(pool4,       layerNum, 8)            
+            pred5 = self.deconv(fc8m,     layerNum, 16, 16, 0)            
 
         with tf.variable_scope('featureMask'):           
             feat = pred1 + pred2 + pred3 + pred4 + pred5
-            feat_act = tf.nn.relu(feat)
+            # feat_act = tf.nn.relu(feat)
 
-            up    = self.pred_deconv(feat_act, num_out_layers=layerNum, scale=2)
-            up_act = tf.nn.relu(up)
-            if(0):#self.params.post_proc):            
-                up_out = self.conv_block(up_act,        layerNum, 3)
-            else:
-                up_out = self.conv(up_act,           layerNum, 3, 1)
+            # up    = self.pred_deconv(feat_act, num_out_layers=layerNum, scale=2)
+            up    = self.deconv(feat,       layerNum, 2, 2, 0)            
+            up_out = self.conv(up,             layerNum, 3, 1)
 
             self.feat_masks = tf.nn.softmax(up_out)
 
@@ -255,7 +258,7 @@ class deep3dModel(object):
             return tf.reduce_sum(disparity_image, axis=4)
 
     def build_model(self):
-        with slim.arg_scope([slim.conv2d, slim.conv2d_transpose], activation_fn=tf.nn.elu):
+        with slim.arg_scope([slim.conv2d, slim.conv2d_transpose], activation_fn=tf.nn.relu):
             with tf.variable_scope('model', reuse=self.reuse_variables):
                 #self.left_pyramid  = self.scale_pyramid(self.left,  5)
                 #self.right_pyramid = self.scale_pyramid(self.right, 5)
@@ -271,7 +274,11 @@ class deep3dModel(object):
 
 
     def generate_disp_est(self, feat_masks):
-        return tf.reduce_sum(feat_masks, axis=3)
+        layers = []
+        for s in np.arange(search_rng):
+            layers.append(feat_masks[None,:,:,s]*s)
+
+        return tf.reduce_sum(layers, axis=3)
 
     def generate_image_right(self, feat_masks, left_image):
         return self.depthDot(feat_masks, left_image)        
@@ -294,7 +301,8 @@ class deep3dModel(object):
         with tf.variable_scope('smoothness'):
             #g_x = self.left[None,:,:-1,:] - self.left[None,:,1:,:] 
             #print('===>self.left: ', self.left.shape)            
-            self.disp_right_smoothness = self.get_smoothness(self.disp_est, self.right)
+            #self.disp_right_smoothness = self.get_smoothness(self.disp_est, self.right)
+            pass
 
         with tf.variable_scope('losses', reuse=self.reuse_variables):
             # IMAGE RECONSTRUCTION
@@ -311,12 +319,12 @@ class deep3dModel(object):
             self.image_loss = self.image_loss_right#tf.add_n(self.image_loss_right)
 
             # DISPARITY SMOOTHNESS
-            self.disp_left_loss  = tf.reduce_mean(tf.abs(self.disp_right_smoothness))
-            self.disp_gradient_loss = self.disp_left_loss #tf.add_n(self.disp_right_loss)
+            #self.disp_left_loss  = tf.reduce_mean(tf.abs(self.disp_right_smoothness))
+            #self.disp_gradient_loss = self.disp_left_loss #tf.add_n(self.disp_right_loss)
             
             #print('===> smoothness_x: ', smoothness_x.dtype)
             # TOTAL LOSS
-            self.total_loss = self.image_loss + self.params.disp_gradient_loss_weight * self.disp_gradient_loss# + self.params.lr_loss_weight * self.lr_loss
+            self.total_loss = self.image_loss #+ self.params.disp_gradient_loss_weight * self.disp_gradient_loss# + self.params.lr_loss_weight * self.lr_loss
 
             # GET MAE
             self.mae = tf.reduce_mean(self.l1_right)*255
